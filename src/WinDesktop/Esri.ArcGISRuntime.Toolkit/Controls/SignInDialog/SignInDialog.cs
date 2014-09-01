@@ -6,6 +6,7 @@
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
@@ -29,10 +30,10 @@ namespace Esri.ArcGISRuntime.Toolkit.Controls
 	/// </summary>
 	/// <remarks>
 	/// This control is designed to work with the <see cref="IdentityManager" />.
-	/// The IdentityManager can be actived with code like:
-	/// IdentityManager.Current.ChallengeMethod = SignInDialog.DoSignIn;
+	/// The SignInDialog can be used with code like:
+	/// IdentityManager.Current.ChallengeHandler = new ChallengeHandler(SignInDialog.DoSignIn);
 	/// In this case, the SignInDialog is created and activated in a child window.
-	/// It's also possible to put the SignInDialog in the Visual Tree and to write your own challenge method activating this SignInDialog.
+	/// It's also possible to put the SignInDialog in the Visual Tree and to write your own challenge handler activating this SignInDialog.
 	/// </remarks>
 	[TemplatePart(Name = "RichTextBoxMessage", Type = typeof(RichTextBox))]
 	[TemplatePart(Name = "RichTextBoxErrorMessage", Type = typeof(RichTextBox))]
@@ -318,6 +319,22 @@ namespace Esri.ArcGISRuntime.Toolkit.Controls
 
 		private static Task<Credential> DoSignInInUIThread(CredentialRequestInfo credentialRequestInfo)
 		{
+			switch (credentialRequestInfo.AuthenticationType)
+			{
+				case AuthenticationType.Token:
+				case AuthenticationType.NetworkCredential:
+					return DoSignInWithSignInDialog(credentialRequestInfo);
+
+				case AuthenticationType.Certificate:
+					return ChallengeCertificate(credentialRequestInfo);
+
+				default:
+					return null;
+			}
+		}
+
+		private static Task<Credential> DoSignInWithSignInDialog(CredentialRequestInfo credentialRequestInfo)
+		{
 			// Create the ChildWindow that contains the SignInDialog
 			var childWindow = new Window
 			{
@@ -369,6 +386,51 @@ namespace Esri.ArcGISRuntime.Toolkit.Controls
 			childWindow.ShowDialog();
 
 			return doSignInTask;
+		}
+
+
+		private static Task<Credential> ChallengeCertificate(CredentialRequestInfo credentialRequestInfo)
+		{
+			var tcs = new TaskCompletionSource<Credential>();
+			var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+			X509Certificate2Collection certificates;
+			try
+			{
+				const string clientAuthOid = "1.3.6.1.5.5.7.3.2"; // Client Authentication OID
+				store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+				// Find Client Authentication certificate
+				certificates = store.Certificates.Find(X509FindType.FindByApplicationPolicy, clientAuthOid, true);
+			}
+			catch (Exception)
+			{
+				certificates = null;
+			}
+			finally
+			{
+				store.Close();
+			}
+
+			if (certificates != null && certificates.Count >= 1)
+			{
+				// Let the user select/validate the certificate
+				string url = credentialRequestInfo.ServiceUri;
+				string resourceName = GetResourceName(url);
+				ServerInfo serverInfo = IdentityManager.Current.FindServerInfo(url);
+				string server = serverInfo == null ? Regex.Match(url, "http.?//[^/]*").ToString() : serverInfo.ServerUri;
+				string message = string.Format("certificate required to access {0} on {1}", resourceName, server); // certificate required to access {0} on {1} // todo would need a resource but toolkit has no resources yet
+				certificates = X509Certificate2UI.SelectFromCollection(certificates, null, message, X509SelectionFlag.SingleSelection);
+			}
+
+			if (certificates != null && certificates.Count > 0)
+			{
+				tcs.TrySetResult(new CertificateCredential(certificates[0]));
+			}
+			else
+			{
+				// Note : Error type is not that important since the error returned to the user is the initial HTTP error (Authorization Error)
+				tcs.TrySetException(new System.Security.Authentication.AuthenticationException());
+			}
+			return tcs.Task;
 		}
 
 		#endregion
